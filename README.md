@@ -14,7 +14,7 @@ This is a fork from [arlolra/meek](https://github.com/arlolra/meek) and made som
 * Now presented data for non-proxy requests can be loaded form an external file. (if `-mask` provided, the content of provided file will be presented, otherwise it will search for index.html file in working directory and if it wasn't available a simple message will appear for user.)
 ### Client
 * Works as a standalone service
-* You should use an external service like [Project X](https://github.com/XTLS/Xray-core) to communicate with server if you are using built-in socks5 option. the config file `config.json` for `Project X` is also available and can be used like `./xray -c config.json` (this config file serve a service with socks5 proxy on port `1080` and http proxy on `8080`).
+* You should use an external service like [Project X](https://github.com/XTLS/Xray-core) to communicate with server if you are using built-in socks5 option. the config file `config.json` for `Project X` is also available and can be used like `./xray -c config.json` (this config file serve a service with socks5 proxy on port `1080` and http proxy on `8080` and needs to be modified if any port change is desired).
 ### Deployment
 You can use pre-built executables in release section. If seeking for a safe build or maybe a specific os you can build it yourself by `go build`.
 ### Run
