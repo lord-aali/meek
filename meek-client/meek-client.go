@@ -1,27 +1,31 @@
 // meek-client is the client transport plugin for the meek pluggable transport.
 //
 // Sample usage in torrc:
-// 	Bridge meek 0.0.2.0:1
-// 	ClientTransportPlugin meek exec ./meek-client --url=https://meek-reflect.appspot.com/ --front=www.google.com --log meek-client.log
+//
+//	Bridge meek 0.0.2.0:1 url=https://forbidden.example/ front=allowed.example
+//	ClientTransportPlugin meek exec ./meek-client
+//
 // The transport ignores the bridge address 0.0.2.0:1 and instead connects to
-// the URL given by --url. When --front is given, the domain in the URL is
+// the URL given by url=. When front= is given, the domain in the URL is
 // replaced by the front domain for the purpose of the DNS lookup, TCP
 // connection, and TLS SNI, but the HTTP Host header in the request will be the
-// one in --url. (For example, in the configuration above, the connection will
-// appear on the outside to be going to www.google.com, but it will actually be
-// dispatched to meek-reflect.appspot.com by the Google frontend server.)
+// one in url=.
 //
 // Most user configuration can happen either through SOCKS args (i.e., args on a
 // Bridge line) or through command line options. SOCKS args take precedence
 // per-connection over command line options. For example, this configuration
 // using SOCKS args:
-// 	Bridge meek 0.0.2.0:1 url=https://meek-reflect.appspot.com/ front=www.google.com
-// 	ClientTransportPlugin meek exec ./meek-client
+//
+//	Bridge meek 0.0.2.0:1 url=https://forbidden.example/ front=allowed.example
+//	ClientTransportPlugin meek exec ./meek-client
+//
 // is the same as this one using command line options:
-// 	Bridge meek 0.0.2.0:1
-// 	ClientTransportPlugin meek exec ./meek-client --url=https://meek-reflect.appspot.com/ --front=www.google.com
-// The advantage of SOCKS args is that multiple Bridge lines can have different
-// configurations, but it requires a newer tor.
+//
+//	Bridge meek 0.0.2.0:1
+//	ClientTransportPlugin meek exec ./meek-client --url=https://forbidden.example/ --front=allowed.example
+//
+// The command-line configuration interface is for compatibility with tor 0.2.4
+// and older, which doesn't support parameters on Bridge lines.
 //
 // The --helper option prevents this program from doing any network operations
 // itself. Rather, it will send all requests through a browser extension that
@@ -29,25 +33,25 @@
 package main
 
 import (
+	"../lib/goptlib"
 	"bufio"
 	"bytes"
 	"crypto/rand"
 	"encoding/base64"
-	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"log"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 )
-
-import "git.torproject.org/pluggable-transports/goptlib.git"
 
 const (
 	ptMethodName = "meek"
@@ -55,7 +59,7 @@ const (
 	// long-lived session. We split a TCP stream across multiple HTTP
 	// requests, and those with the same session ID belong to the same
 	// stream.
-	sessionIdLength = 32
+	sessionIDLength = 8
 	// The size of the largest chunk of data we will read from the SOCKS
 	// port before forwarding it in a request, and the maximum size of a
 	// body we are willing to handle in a reply.
@@ -80,19 +84,25 @@ const (
 	helperWriteTimeout      = 2 * time.Second
 )
 
-var ptInfo pt.ClientInfo
+// We use this RoundTripper to make all our requests when neither --helper nor
+// utls is in effect. We use the defaults, except we take control of the Proxy
+// setting (notably, disabling the default ProxyFromEnvironment).
+var httpRoundTripper *http.Transport = http.DefaultTransport.(*http.Transport).Clone()
+
+// We use this RoundTripper when --helper is in effect.
+var helperRoundTripper = &HelperRoundTripper{
+	ReadTimeout:  helperReadTimeout,
+	WriteTimeout: helperWriteTimeout,
+}
 
 // Store for command line options.
 var options struct {
-	URL        string
-	Front      string
-	ProxyURL   *url.URL
-	HelperAddr *net.TCPAddr
+	URL       string
+	Front     string
+	ProxyURL  *url.URL
+	UseHelper bool
+	UTLSName  string
 }
-
-// When a connection handler starts, +1 is written to this channel; when it
-// ends, -1 is written.
-var handlerChan = make(chan int)
 
 // RequestInfo encapsulates all the configuration used for a request–response
 // roundtrip, including variables that may come from SOCKS args or from the
@@ -105,29 +115,38 @@ type RequestInfo struct {
 	// The Host header to put in the HTTP request (optional and may be
 	// different from the host name in URL).
 	Host string
-	// URL of an upstream proxy to use. If nil, no proxy is used.
-	ProxyURL *url.URL
+	// The RoundTripper to use to send requests. This may vary depending on
+	// the value of global options like --helper.
+	RoundTripper http.RoundTripper
 }
 
-// Do an HTTP roundtrip using the payload data in buf and the request metadata
-// in info.
-func roundTripWithHTTP(buf []byte, info *RequestInfo) (*http.Response, error) {
-	tr := new(http.Transport)
-	if info.ProxyURL != nil {
-		if info.ProxyURL.Scheme != "http" {
-			panic(fmt.Sprintf("don't know how to use proxy %s", info.ProxyURL.String()))
-		}
-		tr.Proxy = http.ProxyURL(info.ProxyURL)
+// Make an http.Request from the payload data in buf and the request metadata in
+// info.
+func makeRequest(buf []byte, info *RequestInfo) (*http.Request, error) {
+	var body io.Reader
+	if len(buf) > 0 {
+		// Leave body == nil when buf is empty. A nil body is an
+		// explicit signal that the body is empty. An empty
+		// *bytes.Reader or the magic value http.NoBody are supposed to
+		// be equivalent ways to signal an empty body, but in Go 1.8 the
+		// HTTP/2 code only understands nil. Not leaving body == nil
+		// causes the Content-Length header to be omitted from HTTP/2
+		// requests, which in some cases can cause the server to return
+		// a 411 "Length Required" error. See
+		// https://bugs.torproject.org/22865.
+		body = bytes.NewReader(buf)
 	}
-	req, err := http.NewRequest("POST", info.URL.String(), bytes.NewReader(buf))
+	req, err := http.NewRequest("POST", info.URL.String(), body)
 	if err != nil {
 		return nil, err
 	}
+	// Prevent Content-Type sniffing by net/http and middleboxes.
+	req.Header.Set("Content-Type", "application/octet-stream")
 	if info.Host != "" {
 		req.Host = info.Host
 	}
 	req.Header.Set("X-Session-Id", info.SessionID)
-	return tr.RoundTrip(req)
+	return req, nil
 }
 
 // Do a roundtrip, trying at most limit times if there is an HTTP status other
@@ -138,21 +157,17 @@ func roundTripWithHTTP(buf []byte, info *RequestInfo) (*http.Response, error) {
 // which will cause the connection to die. The alternative, though, is to just
 // kill the connection immediately. A better solution would be a system of
 // acknowledgements so we know what to resend after an error.
-func roundTripRetries(buf []byte, info *RequestInfo, limit int) (*http.Response, error) {
-	roundTrip := roundTripWithHTTP
-	if options.HelperAddr != nil {
-		roundTrip = roundTripWithHelper
-	}
+func roundTripRetries(rt http.RoundTripper, req *http.Request, limit int) (*http.Response, error) {
 	var resp *http.Response
 	var err error
 again:
 	limit--
-	resp, err = roundTrip(buf, info)
+	resp, err = rt.RoundTrip(req)
 	// Retry only if the HTTP roundtrip completed without error, but
 	// returned a status other than 200. Other kinds of errors and success
 	// with 200 always return immediately.
 	if err == nil && resp.StatusCode != http.StatusOK {
-		err = errors.New(fmt.Sprintf("status code was %d, not %d", resp.StatusCode, http.StatusOK))
+		err = fmt.Errorf("status code was %d, not %d", resp.StatusCode, http.StatusOK)
 		if limit > 0 {
 			log.Printf("%s; trying again after %.f seconds (%d)", err, retryDelay.Seconds(), limit)
 			time.Sleep(retryDelay)
@@ -165,7 +180,11 @@ again:
 // Send the data in buf to the remote URL, wait for a reply, and feed the reply
 // body back into conn.
 func sendRecv(buf []byte, conn net.Conn, info *RequestInfo) (int64, error) {
-	resp, err := roundTripRetries(buf, info, maxTries)
+	req, err := makeRequest(buf, info)
+	if err != nil {
+		return 0, err
+	}
+	resp, err := roundTripRetries(info.RoundTripper, req, maxTries)
 	if err != nil {
 		return 0, err
 	}
@@ -191,7 +210,9 @@ func copyLoop(conn net.Conn, info *RequestInfo) error {
 			// log.Printf("read from local: %q", b)
 			ch <- b
 			if err != nil {
-				log.Printf("error reading from local: %s", err)
+				if err != io.EOF {
+					log.Printf("error reading from local: %s", err)
+				}
 				break
 			}
 		}
@@ -249,42 +270,33 @@ loop:
 	return nil
 }
 
-func genSessionId() string {
-	buf := make([]byte, sessionIdLength)
+func genSessionID() string {
+	buf := make([]byte, sessionIDLength)
 	_, err := rand.Read(buf)
 	if err != nil {
 		panic(err.Error())
 	}
-	return base64.StdEncoding.EncodeToString(buf)
+	return strings.TrimRight(base64.StdEncoding.EncodeToString(buf), "=")
 }
 
 // Callback for new SOCKS requests.
-func handler(conn *pt.SocksConn) error {
-	handlerChan <- 1
-	defer func() {
-		handlerChan <- -1
-	}()
-
+func handleSOCKS(conn *pt.SocksConn) error {
 	defer conn.Close()
-	err := conn.Grant(&net.TCPAddr{IP: net.ParseIP("0.0.0.0"), Port: 0})
+	err := conn.Grant(&net.TCPAddr{IP: net.IPv4zero, Port: 0})
 	if err != nil {
 		return err
 	}
 
 	var info RequestInfo
-	info.SessionID = genSessionId()
+	info.SessionID = genSessionID()
 
-	// First check url= SOCKS arg, then --url option, then SOCKS target.
+	// First check url= SOCKS arg, then --url option.
 	urlArg, ok := conn.Req.Args.Get("url")
 	if ok {
 	} else if options.URL != "" {
 		urlArg = options.URL
 	} else {
-		urlArg = (&url.URL{
-			Scheme: "http",
-			Host:   conn.Req.Target,
-			Path:   "/",
-		}).String()
+		return fmt.Errorf("no URL for SOCKS request")
 	}
 	info.URL, err = url.Parse(urlArg)
 	if err != nil {
@@ -303,34 +315,47 @@ func handler(conn *pt.SocksConn) error {
 		info.URL.Host = front
 	}
 
-	// First check proxy= SOCKS arg, then --proxy option/managed
-	// configuration.
-	proxy, ok := conn.Req.Args.Get("proxy")
-	if ok {
-		info.ProxyURL, err = url.Parse(proxy)
+	// First check utls= SOCKS arg, then --utls option.
+	utlsName, utlsOK := conn.Req.Args.Get("utls")
+	if utlsOK {
+	} else if options.UTLSName != "" {
+		utlsName = options.UTLSName
+		utlsOK = true
+	}
+
+	// First we check --helper: if it was specified, then we always use the
+	// helper, and utls is disallowed. Otherwise, we use utls if requested;
+	// or else fall back to native net/http.
+	if options.UseHelper {
+		if utlsOK {
+			return fmt.Errorf("cannot use utls with --helper")
+		}
+		info.RoundTripper = helperRoundTripper
+	} else if utlsOK {
+		info.RoundTripper, err = NewUTLSRoundTripper(utlsName, nil, options.ProxyURL)
 		if err != nil {
 			return err
 		}
-	} else if options.ProxyURL != nil {
-		info.ProxyURL = options.ProxyURL
+	} else {
+		info.RoundTripper = httpRoundTripper
 	}
 
 	return copyLoop(conn, &info)
 }
 
-func acceptLoop(ln *pt.SocksListener) error {
+func acceptSOCKS(ln *pt.SocksListener) error {
 	defer ln.Close()
 	for {
 		conn, err := ln.AcceptSocks()
 		if err != nil {
 			log.Printf("error in AcceptSocks: %s", err)
-			if e, ok := err.(net.Error); ok && !e.Temporary() {
-				return err
+			if e, ok := err.(net.Error); ok && e.Temporary() {
+				continue
 			}
-			continue
+			return err
 		}
 		go func() {
-			err := handler(conn)
+			err := handleSOCKS(conn)
 			if err != nil {
 				log.Printf("error in handling request: %s", err)
 			}
@@ -342,10 +367,18 @@ func acceptLoop(ln *pt.SocksListener) error {
 // Return an error if this proxy URL doesn't work with the rest of the
 // configuration.
 func checkProxyURL(u *url.URL) error {
-	if options.HelperAddr == nil {
-		// Without the helper we only support HTTP proxies.
-		if options.ProxyURL.Scheme != "http" {
-			return errors.New(fmt.Sprintf("don't understand proxy URL scheme %q", options.ProxyURL.Scheme))
+	if !options.UseHelper {
+		// Without the helper, we use net/http's built-in proxy support,
+		// which allows "http", "https", and "socks5".
+		// socks5 requires go1.9: https://golang.org/doc/go1.9#net/http
+		// https requires go1.10: https://golang.org/doc/go1.10#net/http
+		// If using an older version of Go, the proxy won't be bypassed;
+		// you'll just get an error at connection time rather than
+		// TOR_PT_PROXY time.
+		switch u.Scheme {
+		case "http", "https", "socks5":
+		default:
+			return fmt.Errorf("don't understand proxy URL scheme %q", u.Scheme)
 		}
 	} else {
 		// With the helper we can use HTTP and SOCKS (because it is the
@@ -355,17 +388,17 @@ func checkProxyURL(u *url.URL) error {
 		// covert Host header in HTTP proxy CONNECT requests. Using an
 		// HTTP proxy cannot provide effective obfuscation without such
 		// a patched Firefox.
-		// https://trac.torproject.org/projects/tor/ticket/12146
-		// https://gitweb.torproject.org/tor-browser.git/commitdiff/e08b91c78d919f66dd5161561ca1ad7bcec9a563
+		// https://bugs.torproject.org/12146
+		// https://gitweb.torproject.org/tor-browser.git/commit/?id=e08b91c78d919f66dd5161561ca1ad7bcec9a563
 		// https://bugzilla.mozilla.org/show_bug.cgi?id=1017769
 		// https://hg.mozilla.org/mozilla-central/rev/a1f6458800d4
-		switch options.ProxyURL.Scheme {
+		switch u.Scheme {
 		case "http", "socks5", "socks4a":
 		default:
-			return errors.New(fmt.Sprintf("don't understand proxy URL scheme %q", options.ProxyURL.Scheme))
+			return fmt.Errorf("don't understand proxy URL scheme %q", u.Scheme)
 		}
-		if options.ProxyURL.User != nil {
-			return errors.New("a proxy URL with a username or password can't be used with --helper")
+		if u.User != nil {
+			return fmt.Errorf("a proxy URL with a username or password can't be used with --helper")
 		}
 	}
 	return nil
@@ -375,18 +408,33 @@ func main() {
 	var helperAddr string
 	var logFilename string
 	var proxy string
+	var socksPort string
 	var err error
+
+	os.Setenv("TOR_PT_MANAGED_TRANSPORT_VER", "1")
+	os.Setenv("TOR_PT_CLIENT_TRANSPORTS", "meek")
 
 	flag.StringVar(&options.Front, "front", "", "front domain name if no front= SOCKS arg")
 	flag.StringVar(&helperAddr, "helper", "", "address of HTTP helper (browser extension)")
 	flag.StringVar(&logFilename, "log", "", "name of log file")
-	flag.StringVar(&proxy, "proxy", "", "proxy URL if no proxy= SOCKS arg")
+	flag.StringVar(&proxy, "proxy", "", "proxy URL")
+	flag.StringVar(&socksPort, "port", "4455", "listening socks port")
 	flag.StringVar(&options.URL, "url", "", "URL to request if no url= SOCKS arg")
+	flag.StringVar(&options.UTLSName, "utls", "", "uTLS Client Hello ID")
 	flag.Parse()
 
+	ptInfo, err := pt.ClientSetup(nil)
+	if err != nil {
+		log.Fatalf("error in ClientSetup: %s", err)
+	}
+
+	log.SetFlags(log.LstdFlags | log.LUTC)
 	if logFilename != "" {
 		f, err := os.OpenFile(logFilename, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
 		if err != nil {
+			// If we fail to open the log, emit a message that will
+			// appear in tor's log.
+			pt.CmethodError(ptMethodName, fmt.Sprintf("error opening log file: %s", err))
 			log.Fatalf("error opening log file: %s", err)
 		}
 		defer f.Close()
@@ -394,11 +442,12 @@ func main() {
 	}
 
 	if helperAddr != "" {
-		options.HelperAddr, err = net.ResolveTCPAddr("tcp", helperAddr)
+		options.UseHelper = true
+		helperRoundTripper.HelperAddr, err = net.ResolveTCPAddr("tcp", helperAddr)
 		if err != nil {
 			log.Fatalf("can't resolve helper address: %s", err)
 		}
-		log.Printf("using helper on %s", options.HelperAddr)
+		log.Printf("using helper on %s", helperRoundTripper.HelperAddr)
 	}
 
 	if proxy != "" {
@@ -408,30 +457,33 @@ func main() {
 		}
 	}
 
-	ptInfo, err = pt.ClientSetup([]string{ptMethodName})
-	if err != nil {
-		log.Fatalf("error in ClientSetup: %s", err)
-	}
-	ptProxyURL, err := PtGetProxyURL()
-	if err != nil {
-		PtProxyError(err.Error())
-		log.Fatalf("can't get managed proxy configuration: %s", err)
-	}
+	// Disable the default ProxyFromEnvironment setting.
+	// httpRoundTripper.Proxy is overridden below if options.ProxyURL is
+	// set.
+	httpRoundTripper.Proxy = nil
 
 	// Command-line proxy overrides managed configuration.
 	if options.ProxyURL == nil {
-		options.ProxyURL = ptProxyURL
+		options.ProxyURL = ptInfo.ProxyURL
 	}
 	// Check whether we support this kind of proxy.
 	if options.ProxyURL != nil {
 		err = checkProxyURL(options.ProxyURL)
 		if err != nil {
-			PtProxyError(err.Error())
+			pt.ProxyError(err.Error())
 			log.Fatal(fmt.Sprintf("proxy error: %s", err))
 		}
 		log.Printf("using proxy %s", options.ProxyURL.String())
-		if ptProxyURL != nil {
-			PtProxyDone()
+		httpRoundTripper.Proxy = http.ProxyURL(options.ProxyURL)
+		if options.UseHelper {
+			err = helperRoundTripper.SetProxy(options.ProxyURL)
+			if err != nil {
+				pt.ProxyError(err.Error())
+				log.Fatal(fmt.Sprintf("proxy error: %s", err))
+			}
+		}
+		if ptInfo.ProxyURL != nil {
+			pt.ProxyDone()
 		}
 	}
 
@@ -439,12 +491,12 @@ func main() {
 	for _, methodName := range ptInfo.MethodNames {
 		switch methodName {
 		case ptMethodName:
-			ln, err := pt.ListenSocks("tcp", "127.0.0.1:0")
+			ln, err := pt.ListenSocks("tcp", "127.0.0.1:"+socksPort)
 			if err != nil {
 				pt.CmethodError(methodName, err.Error())
 				break
 			}
-			go acceptLoop(ln)
+			go acceptSOCKS(ln)
 			pt.Cmethod(methodName, ln.Version(), ln.Addr())
 			log.Printf("listening on %s", ln.Addr())
 			listeners = append(listeners, ln)
@@ -454,39 +506,25 @@ func main() {
 	}
 	pt.CmethodsDone()
 
-	var numHandlers int = 0
-	var sig os.Signal
 	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	signal.Notify(sigChan, syscall.SIGTERM)
 
-	// Wait for first signal.
-	sig = nil
-	for sig == nil {
-		select {
-		case n := <-handlerChan:
-			numHandlers += n
-		case sig = <-sigChan:
-			log.Printf("got signal %s", sig)
-		}
+	if os.Getenv("TOR_PT_EXIT_ON_STDIN_CLOSE") == "1" {
+		// This environment variable means we should treat EOF on stdin
+		// just like SIGTERM: https://bugs.torproject.org/15435.
+		go func() {
+			io.Copy(ioutil.Discard, os.Stdin)
+			log.Printf("synthesizing SIGTERM because of stdin close")
+			sigChan <- syscall.SIGTERM
+		}()
 	}
+
+	// Wait for a signal.
+	sig := <-sigChan
+	log.Printf("got signal %s", sig)
+
 	for _, ln := range listeners {
 		ln.Close()
-	}
-
-	if sig == syscall.SIGTERM {
-		log.Printf("done")
-		return
-	}
-
-	// Wait for second signal or no more handlers.
-	sig = nil
-	for sig == nil && numHandlers != 0 {
-		select {
-		case n := <-handlerChan:
-			numHandlers += n
-		case sig = <-sigChan:
-			log.Printf("got second signal %s", sig)
-		}
 	}
 
 	log.Printf("done")
