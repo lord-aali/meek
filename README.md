@@ -1,4 +1,4 @@
-## MEEK 
+## Tor MEEK - Standalone blocking-resistant proxy
 **A blocking-resistant proxy based on http/1.1, h2.**
 
 This is a fork from [arlolra/meek](https://github.com/arlolra/meek) and made some changes to work as a standalone service.
